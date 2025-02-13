@@ -1,0 +1,12 @@
+- op: replace
+  path: "/metadata/name"
+  value: "abcd-foo"
+- op: replace
+  path: "/metadata/namespace"
+  value: "nginx-internal"
+- op: replace
+  path: "/spec/externalName"
+  value: "abcd-internal.foo.com"
+- op: replace
+  path: "/spec/ports/0/port"
+  value: 443

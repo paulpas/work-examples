@@ -1,0 +1,4 @@
+<?xml version="1.0"?>
+<gconf>
+	<entry name="auto_launch" mtime="1330462796" type="bool" value="false"/>
+</gconf>

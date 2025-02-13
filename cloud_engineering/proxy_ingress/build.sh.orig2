@@ -1,0 +1,191 @@
+#!/bin/bash
+
+show_usage() {
+  echo "Usage: ${0} [option...]"
+  echo " -i, --interactive : Choose which overlay to apply interactively"
+  echo " -b, --build       : Only build the overlays, do not execute"
+  echo " -h, --help        : Show usage"
+  echo " --deploy-all      : Build and deploy all overlays"
+  echo " -d, --deploy      : Build and deploy specific overlay"
+}
+
+error_exit() {
+  echo "Error: $1"
+  exit 1
+}
+
+params_file() {
+  local filename="${1}"
+  local dir=$(pwd)
+  while [[ "${dir}" != "/" ]]; do
+    if [[ -f "${dir}/${filename}" ]]; then
+      echo "$(realpath "${dir}/${filename}")"
+      return 0
+    elif [[ -d "${dir}/.git" ]]; then
+      break
+    fi
+    dir=$(dirname "${dir}")
+  done
+  find "$(pwd)" -path "*/.git" -prune -o -name "${filename}" -exec realpath {} \; -quit
+}
+
+CONFIG_FILE=$(params_file params.yaml)
+OVERLAY_ROOT="overlay"
+blocks_count=$(yq eval '. | length' ${CONFIG_FILE})
+DEPLOY_SPECIFIC=''
+INTERACTIVE=false
+BUILD_ONLY=false
+DEPLOY_ALL=false
+
+while (( "$#" )); do
+  case "$1" in
+    -i|--interactive)
+      INTERACTIVE=true
+      shift
+      ;;
+    -b|--build)
+      BUILD_ONLY=true
+      shift
+      ;;
+    --deploy-all)
+      DEPLOY_ALL=true
+      shift
+      ;;
+    -d|--deploy)
+      DEPLOY_SPECIFIC=$2
+      shift 2
+      ;;
+    -h|--help)
+      show_usage
+      exit 0
+      ;;
+    --) # end argument parsing
+      shift
+      break
+      ;;
+    -*|--*=) # unsupported flags
+      echo "Error: Unsupported flag $1" >&2
+      show_usage
+      exit 1
+      ;;
+  esac
+done
+
+for (( i=0; i<${blocks_count}; i++ )); do
+  FQDN=$(yq eval ".[${i}].fqdn" ${CONFIG_FILE})
+  DST_FQDN=$(yq eval ".[${i}].dst_fqdn" ${CONFIG_FILE})
+  SERVICE_NAME=$(yq eval ".[${i}].service_name" ${CONFIG_FILE})
+  NAMESPACE=$(yq eval ".[${i}].namespace" ${CONFIG_FILE})
+  ENDPOINT=$(yq eval ".[${i}].endpoint" ${CONFIG_FILE})
+
+  # Check if the variables are undefined or null. If they are, call the error_exit function to terminate the script with an error message.
+  if [[ -z ${FQDN} || ${FQDN} == "null" ]]; then
+    error_exit "FQDN is null or missing in block ${i}"
+  fi
+  if [[ -z ${DST_FQDN} || ${DST_FQDN} == "null" ]]; then
+    error_exit "DST_FQDN is null or missing in block ${i}"
+  fi
+  if [[ -z ${SERVICE_NAME} || ${SERVICE_NAME} == "null" ]]; then
+    error_exit "SERVICE_NAME is null or missing in block ${i}"
+  fi
+  if [[ -z ${NAMESPACE} || ${NAMESPACE} == "null" ]]; then
+    error_exit "NAMESPACE is null or missing in block ${i}"
+  fi
+  if [[ -z ${ENDPOINT} || ${ENDPOINT} == "null" ]]; then
+    error_exit "ENDPOINT is null or missing in block ${i}"
+  fi
+
+  OVERLAY_DST="${OVERLAY_ROOT}/${FQDN}"
+  mkdir -p ${OVERLAY_DST}
+
+  cat <<EOF > ${OVERLAY_DST}/kustomization.yaml
+  resources:
+    - ../../base
+  patches:
+    - path: ingress-patch.yaml
+      target:
+        kind: Ingress
+    - path: service-patch.yaml
+      target:
+        kind: Service
+EOF
+
+  cat <<EOF > ${OVERLAY_DST}/ingress-patch.yaml
+- op: replace
+  path: "/metadata/name"
+  value: "${SERVICE_NAME}-forwarder"
+- op: replace
+  path: "/metadata/namespace"
+  value: "${NAMESPACE}"
+- op: replace
+  path: "/spec/ingressClassName"
+  value: "nginx-${ENDPOINT}"
+- op: replace
+  path: "/spec/rules/0/host"
+  value: "${FQDN}"
+- op: replace
+  path: "/spec/rules/0/http/paths/0/backend/service/name"
+  value: "${SERVICE_NAME}"
+- op: replace
+  path: "/spec/rules/0/http/paths/0/backend/service/port/number"
+  value: 443
+- op: replace
+  path: "/spec/tls/0/hosts/0"
+  value: "${FQDN}"
+- op: replace
+  path: "/spec/tls/0/secretName"
+  value: "tls-${SERVICE_NAME}-crt"
+- op: add
+  path: "/metadata/annotations/nginx.ingress.kubernetes.io~1upstream-vhost"
+  value: "${DST_FQDN}"
+EOF
+
+  cat <<EOF > ${OVERLAY_DST}/service-patch.yaml
+- op: replace
+  path: "/metadata/name"
+  value: "${SERVICE_NAME}"
+- op: replace
+  path: "/metadata/namespace"
+  value: "${NAMESPACE}"
+- op: replace
+  path: "/spec/externalName"
+  value: "${DST_FQDN}"
+- op: replace
+  path: "/spec/ports/0/port"
+  value: 443
+EOF
+done
+
+if [[ $BUILD_ONLY = 'false' ]]
+then
+  if [[ $DEPLOY_ALL = 'true' ]]
+  then
+    echo "Deploying all overlays"
+    for opt in "${options[@]}"; do
+      echo "Deploying: ${opt}"
+      kubectl apply -k ${OVERLAY_ROOT}/${opt}
+    done
+  elif [[ $INTERACTIVE = 'true' ]]
+  then
+    PS3='Please enter your choice: '
+    options=($(ls ${OVERLAY_ROOT}))
+    select opt in "${options[@]}"; do
+      case $opt in
+        *)
+          echo "You have chosen to deploy: ${opt}"
+          kubectl apply -k ${OVERLAY_ROOT}/${opt}
+          break
+          ;;
+        *)
+          echo "Invalid option $REPLY"
+          ;;
+      esac
+    done
+  elif [[ -n $DEPLOY_SPECIFIC ]]
+  then
+    echo "Deploying: ${DEPLOY_SPECIFIC}"
+    kubectl apply -k ${OVERLAY_ROOT}/${DEPLOY_SPECIFIC}
+  else
+    show_usage
+  fi
+fi

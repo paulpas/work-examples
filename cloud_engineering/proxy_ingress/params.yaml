@@ -1,0 +1,11 @@
+- fqdn: abcd.foo.com
+  dst_fqdn: abcd-internal.foo.com
+  service_name: abcd-foo
+  namespace: nginx-internal
+  endpoint: internal
+
+- fqdn: xyz.foo.com
+  dst_fqdn: xyz-internal.foo.com
+  service_name: xyz-foo
+  namespace: nginx-internal
+  endpoint: internal
