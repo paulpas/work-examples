@@ -1,121 +1,146 @@
 #!/usr/bin/env bash
+# ---------------------------------------------------------------
+# Script to interactively view merge commits with actual diffs
+# Dependencies: git, fzf, gum, delta, awk
+# Usage Example: ./view_merges.sh -d 14
+# ---------------------------------------------------------------
+set -eo pipefail
 
-# List of repository names separated by space
-REPOS=("repo1" "repo2")
+#DAYS_AGO=7
 
-# Default number of days ago to look for commits
-DAYS_AGO=7
+# Used to filter repositories.  Change to "*" for all
+REPO_FILTER="adc*"
 
-# Function to display usage information
 usage() {
-    echo "Usage: $0 [-d <days_ago>]"
-    echo "  -d <days_ago>   Number of days ago to look for commits (default is 7)"
+    echo "Usage: $0 [-d days]"
+    echo "  -d days   Query merge commits from the past specified days (default: 7)"
+    exit 1
 }
-
-# Parse command-line arguments
-while getopts ":d:" opt; do
+if (( $# == "0" )); then
+    usage
+fi
+while getopts ":d:h" opt; do
     case ${opt} in
-        d )
-            DAYS_AGO=$OPTARG
-            ;;
-        \? )
-            usage
-            exit 1
-            ;;
-        * )
-            echo "Invalid option: -$OPTARG requires an argument."
-            usage
-            exit 1
-            ;;
+        d ) DAYS_AGO=$OPTARG ;;
+        h ) usage ;;
+        * ) usage ;;
     esac
 done
 
-# Function to get commits from a specific repository
-get_commits_from_repo() {
-    local REPO_DIR=$1
-    cd "${REPO_DIR}" || return 1
-    git log --since="${DAYS_AGO} days ago" --pretty=format:"%h %ad %s" --date=iso-strict | awk -v repo="${REPO_DIR}" '{print repo " " $0}'
-}
-
-# Function to find Git repositories in the current directory
 find_git_repositories() {
-    local REPOS=$1
-    for REPO in ${REPOS}; do
-        if [ -d "${REPO}/.git" ]; then
-            echo "${REPO}"
-        fi
+    find . -maxdepth 1 -type d -name "${REPO_FILTER}" -exec test -d '{}/.git' ';' -print \
+    | sed 's|^\./||'
+}
+
+get_valid_merge_commits() {
+    local repo=$1
+    cd "$repo" || return 1
+
+    local current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+    [ -z "$current_branch" ] && return 1
+
+    local stashed=0
+    if ! git diff-index --quiet HEAD -- &>/dev/null; then
+        git stash &>/dev/null
+        stashed=1
+    fi
+
+    git checkout main &>/dev/null || git checkout master &>/dev/null
+    git pull &>/dev/null
+
+    local commit_lines
+    commit_lines=$(git log --since="${DAYS_AGO} days ago" --merges \
+        --pretty=format:"%h|%ad|%s" --date=iso-strict 2>/dev/null || echo "")
+
+    local commit_hash commit_date commit_msg
+    while IFS="|" read -r commit_hash commit_date commit_msg; do
+        [[ -z "$commit_hash" || -z "$commit_date" || -z "$commit_msg" ]] && continue
+        git diff --quiet "${commit_hash}"^.."${commit_hash}" &>/dev/null && continue
+        echo "${repo}|${commit_hash}|${commit_date}|${commit_msg}"
+    done <<< "$commit_lines"
+
+    git checkout "$current_branch" &>/dev/null
+    [ "$stashed" -eq 1 ] && git stash pop &>/dev/null
+}
+
+select_valid_repositories() {
+    local repos valid_repos repo
+    repos=($(find_git_repositories))
+
+    for repo in "${repos[@]}"; do
+        [[ -n $(get_valid_merge_commits "$repo") ]] && valid_repos+=("$repo")
     done
-}
 
-# Function to display an interactive list of commits using fzf
-select_commit_with_fzf() {
-    local COMMIT_INFO_LIST=$1
-    echo -e "${COMMIT_INFO_LIST}" | fzf --prompt="Select a commit / Type a string to search / CTRL-C to exit: " --style full --height 90% --border
-}
-
-# Function to extract commit details from selected commit info
-extract_commit_details() {
-    local SELECTED_COMMIT=$1
-    local REPO_NAME=$(echo ${SELECTED_COMMIT} | awk '{print $1}')
-    local COMMIT_ID=$(echo ${SELECTED_COMMIT} | awk '{print $2}')
-    local TIMESTAMP=$(echo ${SELECTED_COMMIT} | awk '{$1=$2=""; print substr($0, index($0,$3))}' | awk '{print $1, $2, $3}')
-    local MESSAGE=$(echo ${SELECTED_COMMIT} | awk '{$1=$2=$3=$4=""; print substr($0, index($0,$5))}')
-    echo "${REPO_NAME} ${COMMIT_ID} ${TIMESTAMP} ${MESSAGE}"
-}
-
-# Function to print commit details
-print_commit_details() {
-    local REPO_NAME=$1
-    local COMMIT_ID=$2
-    local TIMESTAMP=$3
-    local MESSAGE=$4
-    echo "------------------------------------------------------------------"
-    echo "Repository: ${REPO_NAME}"
-    echo "Commit ID: ${COMMIT_ID}"
-    echo "Timestamp: ${TIMESTAMP}"
-    echo "Message: ${MESSAGE}"
-    if git -C "${REPO_NAME}" log -1 --merges --pretty=format:"%s" "${COMMIT_ID}" > /dev/null; then
-        echo "Merge Message: $(git -C "${REPO_NAME}" log -1 --merges --pretty=format:"%b" "${COMMIT_ID}")"
+    if [ ${#valid_repos[@]} -eq 0 ]; then
+        echo "No repositories have valid merge commits with diffs in the past ${DAYS_AGO} days."
+        exit 0
     fi
-    echo "------------------------------------------------------------------"
-    echo "Diff:"
-    git -C "${REPO_NAME}" show ${COMMIT_ID} | delta -s
+
+    gum choose --no-limit "${valid_repos[@]}" --height=24
 }
 
-# Main function to orchestrate the script
+choose_commit_with_fzf() {
+    local commits=("$@")
+    if [ ${#commits[@]} -eq 0 ]; then
+        echo "NO COMMITS IN THE PAST ${DAYS_AGO} DAYS" | fzf --prompt="No commits" --exit-0 --height=10
+        return 1
+    fi
+    printf '%s\n' "${commits[@]}" | column -s'|' -t | fzf --prompt="Select a commit / Type a string to search / CRTL-c to exit: " --height=95%
+}
+
+show_diff_for_commit() {
+    local repo=$1
+    local commit_hash=$2
+
+    # explicitly disable 'pipefail' around delta command only, avoiding script exit on q
+    set +o pipefail
+
+    # ensure 'less' passing results in clean status
+    LESS='--quit-if-one-screen --RAW-CONTROL-CHARS' git -C "$repo" diff "${commit_hash}"^.."${commit_hash}" \
+        | delta --dark --side-by-side --line-numbers
+
+    set -o pipefail
+}
+
 main() {
-    # Convert array to space-separated string
-    local REPO_STRING=$(printf "%s\n" "${REPOS[@]}")
-    # Find repositories with .git directories
-    local GIT_REPOS=($(find_git_repositories "$REPO_STRING"))
-    if [ ${#GIT_REPOS[@]} -eq 0 ]; then
-        echo "No Git repositories found in the specified list."
-        exit 1
-    fi
+    echo "Updating and checking repositories for valid merge commits (this may take a moment)..."
+
+    local selected_repos commit_array selected_commit repo hash
+    selected_repos=($(select_valid_repositories))
+
+    echo "Scanning selected repositories (be patient)..."
+    commit_array=()
+    for repo in "${selected_repos[@]}"; do
+        while IFS= read -r commit_line; do
+            commit_array+=("$commit_line")
+        done < <(get_valid_merge_commits "$repo")
+    done
+
     while true; do
-        # Collect commits from all repositories
-        local COMMIT_INFO_LIST=""
-        for REPO in "${GIT_REPOS[@]}"; do
-            COMMIT_INFO_LIST+=$(get_commits_from_repo "$REPO")
-            COMMIT_INFO_LIST+="\n"
-        done
-        # Select a commit using fzf
-        local SELECTED_COMMIT=$(select_commit_with_fzf "$COMMIT_INFO_LIST")
-        if [ -z "$SELECTED_COMMIT" ]; then
+        selected_commit=$(choose_commit_with_fzf "${commit_array[@]}") || break
+        if [ -z "$selected_commit" ]; then
             echo "No commit selected. Exiting."
-            break #exit 1
-        fi
-        # Extract and print commit details
-        local COMMIT_DETAILS=($(extract_commit_details "$SELECTED_COMMIT"))
-        print_commit_details "${COMMIT_DETAILS[@]}"
-        # Ask if the user wants to continue
-        read -p "Press any key to return to the menu or (n) to exit: (*/n) " CONTINUE
-        if [[ $CONTINUE =~ ^[Nn]$ ]]; then
+            break
+        elif [[ "$selected_commit" == "NO COMMITS IN THE PAST"* ]]; then
+            echo "$selected_commit"
             break
         fi
+
+        # Carefully parse selection
+        repo=$(awk '{print $1}' <<< "$selected_commit")
+        hash=$(awk '{print $2}' <<< "$selected_commit")
+
+        clear
+        echo "Repository: $repo | Commit: $hash"
+        #printf '%s\n' "-------------------------------------------------------------"
+        show_diff_for_commit "$repo" "$hash"
+        #printf '%s\n' "-------------------------------------------------------------"
+
+        # safely prompt return to menu
+        #echo "Press ENTER to return to commit selection, or CTRL+C to quit."
+        #read -r _
     done
 }
 
-# Run the main function
-main
+main "$@"
 
